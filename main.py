@@ -6,13 +6,16 @@ import secrets
 import sys
 import io
 import geoip2.database
+import httpx
+import datetime
+import re
 from sqlalchemy import text 
 from typing import List
 from fastapi import FastAPI, Depends, WebSocket, HTTPException, Request
-import httpx
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, Column, String, Integer, Boolean, Float, Text, LargeBinary, DateTime
-from sqlalchemy.ext.declarative import declarative_base
+from contextlib import asynccontextmanager
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from security_logic import encrypt_now, check_online
 from security_utils import PremiumEngine
@@ -20,6 +23,7 @@ from datetime import datetime
 from fastapi import BackgroundTasks
 from map_logic import PremiumMapEngine
 from fastapi.responses import HTMLResponse
+from sync_handler import sync_data_online
 
 # --- 3. FASTAPI APP INITIALIZATION ---
 app = FastAPI(title="Jarvis Advanced API 2.0", version="2.0.0")
@@ -28,8 +32,10 @@ app = FastAPI(title="Jarvis Advanced API 2.0", version="2.0.0")
 async def home():
     return {"status": "Jarvis API 2.0 Running", "documentation": "/docs"}
 
-@app.on_event("startup")
-async def startup_event():
+# --- 3. FASTAPI APP INITIALIZATION ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- Startup Logic ---
     # Render safety check: master_access.key agar nahi hai toh auto-create ho jaye
     if not os.path.exists("master_access.key"):
         with open("master_access.key", "w") as f:
@@ -37,6 +43,13 @@ async def startup_event():
         print("🔑 master_access.key auto-created for online server safety!")
         
     asyncio.create_task(auto_sync_worker())
+    
+    yield # App jab tak chalega ye yahin ruka rahega
+    
+    # --- Shutdown Logic ---
+    pass
+
+app = FastAPI(title="Jarvis Advanced API 2.0", version="2.0.0", lifespan=lifespan)
 
 # --- 1. DATABASE SETUP (DYNAMIC SWITCH TO POSTGRESQL) ---
 # Online server (Render) par 'DATABASE_URL' environment variable milega, local par ye SQLite chalayega
@@ -261,8 +274,40 @@ async def internal_batch_handler(
     }
 
 def my_own_api_logic(prompt):
-    return f"Response for: {prompt}"
+    command = prompt.lower().strip()
 
+    # --- Identity & Memory ---
+    if "who are you" in command or "tum kaun ho" in command:
+        return "Main Jarvis hoon, ek advanced private AI assistant. Mera nirmaan Sudipto ne kiya hai."
+    
+    elif "who is your boss" in command or "creator" in command or "boss" in command:
+        return "Mere creator aur Supreme Commander Sudipto hain. Main sirf unhi ke commands follow karta hoon."
+
+    # --- Time & Space Engine ---
+    elif "time" in command or "samay" in command:
+        now = datetime.datetime.now()
+        return f"System clock ke hisaab se abhi {now.strftime('%I:%M %p')} ho raha hai."
+        
+    elif "date" in command or "aaj kya hai" in command:
+        now = datetime.datetime.now()
+        return f"Aaj ki tareekh {now.strftime('%d %B %Y')} hai, aur aaj {now.strftime('%A')} hai."
+
+    # --- Smart Math Solver ---
+    elif "calculate" in command or "+" in command or "-" in command or "*" in command or "/" in command:
+        try:
+            math_expr = re.sub('[^0-9\+\-\*\/\(\)\.]', '', command)
+            if math_expr:
+                result = eval(math_expr)
+                return f"Is calculation ka result hai: {result}"
+            else:
+                return "Aapne koi valid number nahi diya calculation ke liye."
+        except Exception:
+            return "Sorry, ye calculation samajh nahi aayi. Kripya clear numbers batayein."
+
+    # --- Fallback ---
+    else:
+        return f"Command received: '{prompt}'. (Yeh request server par log ho gayi hai, iska logic jald hi update hoga.)"
+    
 def get_or_set_cache(db, user_prompt, api_call_func):
     p_hash = hashlib.sha256(user_prompt.strip().encode('utf-8')).hexdigest()
     cached_item = db.query(PromptCache).filter(PromptCache.hash == p_hash).first()
@@ -315,18 +360,19 @@ async def create_api_key(owner_name: str, limit: int = 1000, db: Session = Depen
         "api_key": new_key_value,
         "limit": limit
     }
+# main.py ke andar
+MY_PERMANENT_KEY = "jarvis_super_secret_2026_key" # Ye tumhari permanent key hogi
 
-# FIXED: Ab ye function sach mein database se token secure check karega!
 def validate_api_key(api_key: str, db: Session = Depends(get_db)):
+    # 1. Pehle permanent key check karo
+    if api_key == MY_PERMANENT_KEY:
+        return "Admin_Owner"
+    
+    # 2. Agar permanent nahi hai, tabhi database mein dhundo
     key = db.query(APIKey).filter(APIKey.key_value == api_key, APIKey.is_active == True).first()
     if not key:
-        raise HTTPException(status_code=401, detail="Invalid or Inactive API Key")
+        raise HTTPException(status_code=401, detail="Invalid API Key")
     
-    if key.current_usage >= key.usage_limit:
-        raise HTTPException(status_code=403, detail="API Key usage limit reached")
-        
-    key.current_usage += 1
-    db.commit()
     return key.owner
 
 @app.post("/v2/get_answer")
@@ -485,3 +531,4 @@ async def auto_sync_worker():
         finally:
             db.close()
         await asyncio.sleep(30)
+       
